@@ -1,9 +1,31 @@
 /**
  * Dependency-free WebGL2 renderer for the spinning CONDUIT hero sneaker.
+ *
+ * Frame pipeline:
+ *   1. shadow-map depth pass from the key softbox (PCSS: blocker search + PCF)
+ *   2. view-space normal/depth prepass → half-res SSAO → depth-aware blur
+ *   3. HDR scene pass into an MSAA float target: reflection → floor → shoe
+ *   4. resolve, half/quarter-res bloom, ACES tone map + grain, composite
+ *
  * Usage: const stop = mountConduitHero(canvas, { onAzimuth }); …; stop()
  */
 import { buildShoe, type MeshData, type PartId } from './geometry'
-import { FLOOR_FS, FLOOR_VS, SHOE_FS, SHOE_VS } from './shaders'
+import {
+  AO_BLUR_FS,
+  BLUR_FS,
+  BRIGHT_FS,
+  COMPOSITE_FS,
+  FLOOR_FS,
+  FLOOR_VS,
+  ND_FS,
+  ND_VS,
+  POST_VS,
+  SHADOW_FS,
+  SHADOW_VS,
+  SHOE_FS,
+  SHOE_VS,
+  SSAO_FS,
+} from './shaders'
 
 type M4 = Float32Array
 
@@ -31,6 +53,16 @@ const m4 = {
     m[10] = (f + n) / (n - f)
     m[11] = -1
     m[14] = (2 * f * n) / (n - f)
+    return m
+  },
+  ortho(l: number, r: number, b: number, t: number, n: number, f: number): M4 {
+    const m = m4.ident()
+    m[0] = 2 / (r - l)
+    m[5] = 2 / (t - b)
+    m[10] = -2 / (f - n)
+    m[12] = -(r + l) / (r - l)
+    m[13] = -(t + b) / (t - b)
+    m[14] = -(f + n) / (f - n)
     return m
   },
   lookAt(e: number[], c: number[], up: number[]): M4 {
@@ -76,8 +108,7 @@ const m4 = {
   },
   normal3(m: M4): Float32Array {
     // model matrices here are rotation (+ uniform scale / mirror): upper 3×3, renormalised
-    const o = new Float32Array([m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]])
-    return o
+    return new Float32Array([m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]])
   },
 }
 function cross3(a: number[], b: number[]) {
@@ -112,6 +143,7 @@ function compile(gl: WebGL2RenderingContext, vs: string, fs: string) {
   }
   return { p, u }
 }
+type Program = ReturnType<typeof compile>
 
 interface GpuMesh {
   vao: WebGLVertexArrayObject
@@ -139,6 +171,17 @@ function upload(gl: WebGL2RenderingContext, mesh: MeshData, part: PartId): GpuMe
   return { vao, count: mesh.indices.length, part }
 }
 
+/* ---------- render targets ---------- */
+interface Target {
+  fb: WebGLFramebuffer
+  tex: WebGLTexture
+  w: number
+  h: number
+}
+
+const SHADOW_SIZE = 2048
+const KEY_DIR = norm3([-0.45, 0.85, 0.6]) // must match Ls[0] in SHOE_FS
+
 export interface ConduitHeroOptions {
   /** called ~10×/s with the current heading in degrees (0–360) */
   onAzimuth?: (deg: number) => void
@@ -150,18 +193,40 @@ export interface ConduitHeroOptions {
 }
 
 export function mountConduitHero(canvas: HTMLCanvasElement, opts: ConduitHeroOptions = {}): () => void {
-  const gl = canvas.getContext('webgl2', { antialias: true, alpha: true, premultipliedAlpha: true })
+  const gl = canvas.getContext('webgl2', { antialias: false, alpha: true, premultipliedAlpha: true })
   if (!gl) {
     opts.onError?.(new Error('WebGL2 unavailable'))
     return () => {}
   }
 
-  let shoeProg: ReturnType<typeof compile>
-  let floorProg: ReturnType<typeof compile>
+  // HDR targets when the GPU can render to half-float; otherwise pre-expose into
+  // sRGB-encoded 8-bit targets (the encoding keeps precision in the dark end).
+  const hdr = !!(gl.getExtension('EXT_color_buffer_float') || gl.getExtension('EXT_color_buffer_half_float'))
+  const PRE = hdr ? 1 : 0.5
+  const colorFmt = hdr ? gl.RGBA16F : gl.SRGB8_ALPHA8
+  const colorType = hdr ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE
+  const samples = Math.min(4, gl.getParameter(gl.MAX_SAMPLES) as number)
+
+  let shoeProg: Program
+  let floorProg: Program
+  let shadowProg: Program
+  let ndProg: Program
+  let ssaoProg: Program
+  let aoBlurProg: Program
+  let brightProg: Program
+  let blurProg: Program
+  let compProg: Program
   let meshes: GpuMesh[]
   try {
     shoeProg = compile(gl, SHOE_VS, SHOE_FS)
     floorProg = compile(gl, FLOOR_VS, FLOOR_FS)
+    shadowProg = compile(gl, SHADOW_VS, SHADOW_FS)
+    ndProg = compile(gl, ND_VS, ND_FS)
+    ssaoProg = compile(gl, POST_VS, SSAO_FS)
+    aoBlurProg = compile(gl, POST_VS, AO_BLUR_FS)
+    brightProg = compile(gl, POST_VS, BRIGHT_FS)
+    blurProg = compile(gl, POST_VS, BLUR_FS)
+    compProg = compile(gl, POST_VS, COMPOSITE_FS)
     meshes = buildShoe().map((s) => upload(gl, s.mesh, s.part))
   } catch (err) {
     opts.onError?.(err)
@@ -177,6 +242,125 @@ export function mountConduitHero(canvas: HTMLCanvasElement, opts: ConduitHeroOpt
   gl.enableVertexAttribArray(0)
   gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
   gl.bindVertexArray(null)
+  // empty VAO for the full-screen triangle (vertices come from gl_VertexID)
+  const postVao = gl.createVertexArray()!
+
+  /* ---------- shadow map ---------- */
+  const shadowTex = gl.createTexture()!
+  gl.bindTexture(gl.TEXTURE_2D, shadowTex)
+  gl.texStorage2D(gl.TEXTURE_2D, 1, gl.DEPTH_COMPONENT24, SHADOW_SIZE, SHADOW_SIZE)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+  // Two sampler objects over the same depth texture: one does the hardware
+  // compare (PCF taps), the other returns raw depth (PCSS blocker search).
+  const cmpSampler = gl.createSampler()!
+  gl.samplerParameteri(cmpSampler, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+  gl.samplerParameteri(cmpSampler, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+  gl.samplerParameteri(cmpSampler, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+  gl.samplerParameteri(cmpSampler, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+  gl.samplerParameteri(cmpSampler, gl.TEXTURE_COMPARE_MODE, gl.COMPARE_REF_TO_TEXTURE)
+  gl.samplerParameteri(cmpSampler, gl.TEXTURE_COMPARE_FUNC, gl.LEQUAL)
+  const rawSampler = gl.createSampler()!
+  gl.samplerParameteri(rawSampler, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+  gl.samplerParameteri(rawSampler, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+  gl.samplerParameteri(rawSampler, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+  gl.samplerParameteri(rawSampler, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+  const shadowFb = gl.createFramebuffer()!
+  gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFb)
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, shadowTex, 0)
+  gl.drawBuffers([gl.NONE])
+  gl.readBuffer(gl.NONE)
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+  gl.bindTexture(gl.TEXTURE_2D, null)
+
+  const lightView = m4.lookAt([KEY_DIR[0] * 6, 0.5 + KEY_DIR[1] * 6, KEY_DIR[2] * 6], [0, 0.5, 0], [0, 1, 0])
+  const lightVP = m4.mul(m4.ortho(-2.1, 2.1, -2.1, 2.1, 0.5, 12), lightView)
+
+  /* ---------- scene + post targets (rebuilt on resize) ---------- */
+  let msaaFb: WebGLFramebuffer | null = null
+  let msaaColor: WebGLRenderbuffer | null = null
+  let msaaDepth: WebGLRenderbuffer | null = null
+  let scene: Target | null = null
+  let bloomA: Target | null = null
+  let bloomB: Target | null = null
+  let wideA: Target | null = null
+  let wideB: Target | null = null
+  let nd: Target | null = null
+  let ndDepth: WebGLRenderbuffer | null = null
+  let aoA: Target | null = null
+  let aoB: Target | null = null
+  // SSAO needs a float normal/depth target; without it the AO term is skipped
+  const aoOn = hdr
+
+  const makeTarget = (w: number, h: number, fmt: number = colorFmt, type: number = colorType): Target => {
+    const tex = gl.createTexture()!
+    gl.bindTexture(gl.TEXTURE_2D, tex)
+    gl.texImage2D(gl.TEXTURE_2D, 0, fmt, w, h, 0, gl.RGBA, type, null)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+    const fb = gl.createFramebuffer()!
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb)
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    gl.bindTexture(gl.TEXTURE_2D, null)
+    return { fb, tex, w, h }
+  }
+  const freeTarget = (t: Target | null) => {
+    if (!t) return
+    gl.deleteFramebuffer(t.fb)
+    gl.deleteTexture(t.tex)
+  }
+  const freeTargets = () => {
+    if (msaaFb) gl.deleteFramebuffer(msaaFb)
+    if (msaaColor) gl.deleteRenderbuffer(msaaColor)
+    if (msaaDepth) gl.deleteRenderbuffer(msaaDepth)
+    msaaFb = msaaColor = msaaDepth = null
+    freeTarget(scene); freeTarget(bloomA); freeTarget(bloomB); freeTarget(wideA); freeTarget(wideB)
+    freeTarget(nd); freeTarget(aoA); freeTarget(aoB)
+    if (ndDepth) gl.deleteRenderbuffer(ndDepth)
+    scene = bloomA = bloomB = wideA = wideB = nd = aoA = aoB = null
+    ndDepth = null
+  }
+  const buildTargets = (w: number, h: number) => {
+    freeTargets()
+    msaaColor = gl.createRenderbuffer()!
+    gl.bindRenderbuffer(gl.RENDERBUFFER, msaaColor)
+    gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, colorFmt, w, h)
+    msaaDepth = gl.createRenderbuffer()!
+    gl.bindRenderbuffer(gl.RENDERBUFFER, msaaDepth)
+    gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, gl.DEPTH_COMPONENT24, w, h)
+    gl.bindRenderbuffer(gl.RENDERBUFFER, null)
+    msaaFb = gl.createFramebuffer()!
+    gl.bindFramebuffer(gl.FRAMEBUFFER, msaaFb)
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, msaaColor)
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, msaaDepth)
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+    if (!ok) throw new Error('MSAA framebuffer incomplete')
+    scene = makeTarget(w, h)
+    const hw = Math.max(1, w >> 1), hh = Math.max(1, h >> 1)
+    const qw = Math.max(1, w >> 2), qh = Math.max(1, h >> 2)
+    bloomA = makeTarget(hw, hh)
+    bloomB = makeTarget(hw, hh)
+    wideA = makeTarget(qw, qh)
+    wideB = makeTarget(qw, qh)
+    if (aoOn) {
+      nd = makeTarget(w, h, gl.RGBA16F, gl.HALF_FLOAT)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, nd.fb)
+      ndDepth = gl.createRenderbuffer()!
+      gl.bindRenderbuffer(gl.RENDERBUFFER, ndDepth)
+      gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h)
+      gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, ndDepth)
+      gl.bindRenderbuffer(gl.RENDERBUFFER, null)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+      aoA = makeTarget(hw, hh, gl.RGBA8, gl.UNSIGNED_BYTE)
+      aoB = makeTarget(hw, hh, gl.RGBA8, gl.UNSIGNED_BYTE)
+    }
+  }
 
   const reduced = !!opts.reducedMotion
   const BASE_SPEED = reduced ? 0 : 0.42 // rad/s
@@ -205,6 +389,14 @@ export function mountConduitHero(canvas: HTMLCanvasElement, opts: ConduitHeroOpt
     if (canvas.width !== W || canvas.height !== H) {
       canvas.width = W
       canvas.height = H
+    }
+    if (!scene || scene.w !== W || scene.h !== H) {
+      try {
+        buildTargets(W, H)
+      } catch (err) {
+        opts.onError?.(err)
+        return
+      }
     }
     if (!running) draw(performance.now())
   }
@@ -265,8 +457,21 @@ export function mountConduitHero(canvas: HTMLCanvasElement, opts: ConduitHeroOpt
   canvas.addEventListener('webglcontextlost', onLost)
 
   /* ---------- render ---------- */
+  const blit = (prog: Program, dst: Target | null, w: number, h: number, bind: () => void) => {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, dst ? dst.fb : null)
+    gl.viewport(0, 0, w, h)
+    gl.useProgram(prog.p)
+    bind()
+    gl.bindVertexArray(postVao)
+    gl.drawArrays(gl.TRIANGLES, 0, 3)
+  }
+  const bindTex = (unit: number, tex: WebGLTexture | null) => {
+    gl.activeTexture(gl.TEXTURE0 + unit)
+    gl.bindTexture(gl.TEXTURE_2D, tex)
+  }
+
   function draw(now: number) {
-    if (!gl || disposed) return
+    if (!gl || disposed || !scene || !msaaFb) return
     const dt = Math.min(0.05, (now - lastT) / 1000)
     lastT = now
     const time = (now - t0) / 1000
@@ -307,22 +512,92 @@ export function mountConduitHero(canvas: HTMLCanvasElement, opts: ConduitHeroOpt
     const phase = time % 7
     const scan = reduced ? -10 : phase < 2.4 ? -0.05 + (phase / 2.4) * 1.3 : -10
 
+    gl.disable(gl.CULL_FACE)
+    gl.disable(gl.SCISSOR_TEST)
+
+    /* 1. shadow depth pass */
+    bindTex(0, null)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFb)
+    gl.viewport(0, 0, SHADOW_SIZE, SHADOW_SIZE)
+    gl.enable(gl.DEPTH_TEST)
+    gl.depthMask(true)
+    gl.disable(gl.BLEND)
+    gl.clear(gl.DEPTH_BUFFER_BIT)
+    gl.enable(gl.POLYGON_OFFSET_FILL)
+    gl.polygonOffset(1.5, 2.0)
+    gl.useProgram(shadowProg.p)
+    gl.uniformMatrix4fv(shadowProg.u('uModel'), false, model)
+    gl.uniformMatrix4fv(shadowProg.u('uLightVP'), false, lightVP)
+    for (const mesh of meshes) {
+      gl.bindVertexArray(mesh.vao)
+      gl.drawElements(gl.TRIANGLES, mesh.count, gl.UNSIGNED_INT, 0)
+    }
+    gl.disable(gl.POLYGON_OFFSET_FILL)
+
+    /* 2. normal/depth prepass → SSAO */
+    if (aoOn && nd && aoA && aoB) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, nd.fb)
+      gl.viewport(0, 0, W, H)
+      gl.clearColor(0, 0, 0, 1) // +z = "no geometry"
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
+      gl.useProgram(ndProg.p)
+      gl.uniformMatrix4fv(ndProg.u('uModel'), false, model)
+      gl.uniformMatrix4fv(ndProg.u('uView'), false, view)
+      gl.uniformMatrix4fv(ndProg.u('uViewProj'), false, vp)
+      gl.uniformMatrix3fv(ndProg.u('uNrmMat'), false, m4.normal3(model))
+      for (const mesh of meshes) {
+        gl.bindVertexArray(mesh.vao)
+        gl.drawElements(gl.TRIANGLES, mesh.count, gl.UNSIGNED_INT, 0)
+      }
+      gl.disable(gl.DEPTH_TEST)
+      const tanH = Math.tan(fov / 2)
+      blit(ssaoProg, aoA, aoA.w, aoA.h, () => {
+        bindTex(0, nd!.tex)
+        gl.uniform1i(ssaoProg.u('uND'), 0)
+        gl.uniformMatrix4fv(ssaoProg.u('uProj'), false, proj)
+        gl.uniform2f(ssaoProg.u('uProjScale'), tanH * aspect, tanH)
+        gl.uniform1f(ssaoProg.u('uRadius'), 0.16)
+      })
+      blit(aoBlurProg, aoB, aoB.w, aoB.h, () => {
+        bindTex(0, aoA!.tex)
+        bindTex(1, nd!.tex)
+        gl.uniform1i(aoBlurProg.u('uAO'), 0)
+        gl.uniform1i(aoBlurProg.u('uND'), 1)
+        gl.uniform2f(aoBlurProg.u('uTexel'), 1 / aoB!.w, 1 / aoB!.h)
+      })
+      bindTex(1, null)
+    }
+
+    /* 3. HDR scene pass */
+    gl.bindFramebuffer(gl.FRAMEBUFFER, msaaFb)
     gl.viewport(0, 0, W, H)
     gl.clearColor(0, 0, 0, 0)
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
     gl.enable(gl.BLEND)
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
-    gl.disable(gl.CULL_FACE)
+    bindTex(0, shadowTex)
+    gl.bindSampler(0, cmpSampler)
+    bindTex(1, shadowTex)
+    gl.bindSampler(1, rawSampler)
+    bindTex(2, aoOn && aoB ? aoB.tex : null)
 
     const drawShoe = (m: M4, isMirror: boolean) => {
       gl.useProgram(shoeProg.p)
       gl.uniformMatrix4fv(shoeProg.u('uModel'), false, m)
       gl.uniformMatrix4fv(shoeProg.u('uViewProj'), false, vp)
+      gl.uniformMatrix4fv(shoeProg.u('uLightVP'), false, lightVP)
       gl.uniformMatrix3fv(shoeProg.u('uNrmMat'), false, m4.normal3(m))
       gl.uniform3f(shoeProg.u('uCam'), eye[0], eye[1], eye[2])
       gl.uniform1f(shoeProg.u('uTime'), time)
       gl.uniform1f(shoeProg.u('uScan'), isMirror ? -10 : scan)
       gl.uniform1f(shoeProg.u('uMirror'), isMirror ? 1 : 0)
+      gl.uniform1f(shoeProg.u('uPre'), PRE)
+      gl.uniform1i(shoeProg.u('uShadow'), 0)
+      gl.uniform1i(shoeProg.u('uShadowRaw'), 1)
+      gl.uniform1i(shoeProg.u('uAO'), 2)
+      gl.uniform2f(shoeProg.u('uRes'), W, H)
+      gl.uniform1f(shoeProg.u('uAOOn'), aoOn && !isMirror ? 1 : 0)
+      gl.uniform1f(shoeProg.u('uShadowTexel'), 1 / SHADOW_SIZE)
       for (const mesh of meshes) {
         gl.uniform1i(shoeProg.u('uPart'), mesh.part)
         gl.bindVertexArray(mesh.vao)
@@ -330,23 +605,77 @@ export function mountConduitHero(canvas: HTMLCanvasElement, opts: ConduitHeroOpt
       }
     }
 
-    // 1. reflection
+    // 3a. reflection
     gl.enable(gl.DEPTH_TEST)
     drawShoe(mirror, true)
-    // 2. floor HUD + contact shadow
+    // 3b. floor: cast shadow, contact occlusion, HUD
     gl.disable(gl.DEPTH_TEST)
     gl.useProgram(floorProg.p)
     gl.uniformMatrix4fv(floorProg.u('uViewProj'), false, vp)
+    gl.uniformMatrix4fv(floorProg.u('uLightVP'), false, lightVP)
     gl.uniform1f(floorProg.u('uYaw'), yaw)
     gl.uniform1f(floorProg.u('uTime'), time)
     gl.uniform1f(floorProg.u('uLift'), lift - 0.2)
+    gl.uniform1f(floorProg.u('uPre'), PRE)
+    gl.uniform1i(floorProg.u('uShadow'), 0)
+    gl.uniform1i(floorProg.u('uShadowRaw'), 1)
+    gl.uniform1f(floorProg.u('uShadowTexel'), 1 / SHADOW_SIZE)
     gl.bindVertexArray(floorVao)
     gl.drawArrays(gl.TRIANGLES, 0, 6)
-    // 3. the shoe
+    // 3c. the shoe
     gl.enable(gl.DEPTH_TEST)
     gl.clear(gl.DEPTH_BUFFER_BIT)
     drawShoe(model, false)
     gl.bindVertexArray(null)
+
+    gl.bindSampler(0, null)
+    gl.bindSampler(1, null)
+    bindTex(2, null); bindTex(1, null)
+
+    /* 4. resolve MSAA → scene texture */
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, msaaFb)
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, scene.fb)
+    gl.blitFramebuffer(0, 0, W, H, 0, 0, W, H, gl.COLOR_BUFFER_BIT, gl.NEAREST)
+
+    /* 5. bloom */
+    gl.disable(gl.DEPTH_TEST)
+    gl.disable(gl.BLEND)
+    const bA = bloomA!, bB = bloomB!, wA = wideA!, wB = wideB!
+    blit(brightProg, bA, bA.w, bA.h, () => {
+      bindTex(0, scene!.tex)
+      gl.uniform1i(brightProg.u('uTex'), 0)
+      gl.uniform2f(brightProg.u('uTexel'), 1 / W, 1 / H)
+      gl.uniform1f(brightProg.u('uInvPre'), 1 / PRE)
+      gl.uniform1f(brightProg.u('uThreshold'), 0.9)
+    })
+    const blur = (src: Target, dst: Target, dx: number, dy: number) =>
+      blit(blurProg, dst, dst.w, dst.h, () => {
+        bindTex(0, src.tex)
+        gl.uniform1i(blurProg.u('uTex'), 0)
+        gl.uniform2f(blurProg.u('uDir'), dx / src.w, dy / src.h)
+      })
+    blur(bA, bB, 1, 0)
+    blur(bB, bA, 0, 1)
+    // wide halo: quarter res, blurred twice more
+    blur(bA, wA, 1, 0)
+    blur(wA, wB, 0, 1)
+    blur(wB, wA, 1.5, 0)
+    blur(wA, wB, 0, 1.5)
+
+    /* 6. composite to the canvas */
+    blit(compProg, null, W, H, () => {
+      bindTex(0, scene!.tex)
+      bindTex(1, bA.tex)
+      bindTex(2, wB.tex)
+      gl.uniform1i(compProg.u('uScene'), 0)
+      gl.uniform1i(compProg.u('uBloom'), 1)
+      gl.uniform1i(compProg.u('uBloomWide'), 2)
+      gl.uniform1f(compProg.u('uInvPre'), 1 / PRE)
+      gl.uniform1f(compProg.u('uTime'), time)
+      gl.uniform2f(compProg.u('uRes'), W, H)
+    })
+    gl.bindVertexArray(null)
+    bindTex(2, null); bindTex(1, null); bindTex(0, null)
 
     if (now - lastAz > 100) {
       lastAz = now
@@ -394,11 +723,16 @@ export function mountConduitHero(canvas: HTMLCanvasElement, opts: ConduitHeroOpt
     canvas.removeEventListener('pointerup', onUp)
     canvas.removeEventListener('pointercancel', onUp)
     canvas.removeEventListener('webglcontextlost', onLost)
-    // Free GPU buffers but keep the context alive: React StrictMode re-mounts
+    // Free GPU resources but keep the context alive: React StrictMode re-mounts
     // on the same <canvas>, and a lost context can't be re-acquired.
     for (const m of meshes) gl.deleteVertexArray(m.vao)
     gl.deleteVertexArray(floorVao)
-    gl.deleteProgram(shoeProg.p)
-    gl.deleteProgram(floorProg.p)
+    gl.deleteVertexArray(postVao)
+    gl.deleteFramebuffer(shadowFb)
+    gl.deleteTexture(shadowTex)
+    gl.deleteSampler(cmpSampler)
+    gl.deleteSampler(rawSampler)
+    freeTargets()
+    for (const p of [shoeProg, floorProg, shadowProg, ndProg, ssaoProg, aoBlurProg, brightProg, blurProg, compProg]) gl.deleteProgram(p.p)
   }
 }

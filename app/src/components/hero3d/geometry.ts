@@ -397,17 +397,28 @@ function soleProfile(t: number): [number, number][] {
     [-0.03, bot],
   ]
 }
+/** Angular sculpt grooves carved into the foam below the carbon cage (depth into the wall). */
+function foamGroove(t: number, y: number) {
+  const hs = soleTop(t)
+  const cageLow = hs - 0.07
+  const bot = MID_BOTTOM + archLift(t)
+  const win = ss(bot + 0.02, bot + 0.045, y) * (1 - ss(cageLow - 0.035, cageLow - 0.015, y))
+  const ph = Math.abs(((t * 14 - y * 6) % 1 + 1) % 1 - 0.5)
+  const g = 1 - ss(0.02, 0.1, ph)
+  return 0.012 * g * win
+}
 function solePoint(s: number, v: number): V3 {
   const o = outline(s)
   const [nx, nz] = outlineNormal(s)
-  const [off, y] = catmull2(soleProfile(o.t), v)
+  const [off0, y] = catmull2(soleProfile(o.t), v)
+  const off = off0 - foamGroove(o.t, y)
   return bend([o.x + nx * off, y, o.z + nz * off])
 }
 
 function buildSoleWall(): MeshData {
   const b = new Builder()
-  const ss_ = Array.from({ length: 360 }, (_, i) => i / 360)
-  const vs = range(60, (v) => v)
+  const ss_ = Array.from({ length: 720 }, (_, i) => i / 720)
+  const vs = range(90, (v) => v)
   const base = b.p.length / 3
   const d = 1e-4
   for (const s of ss_) {

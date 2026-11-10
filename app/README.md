@@ -96,6 +96,14 @@ no Three.js or other 3D dependency. It is mounted from `CatalogPage` and falls b
 `public/images/hero-conduit.jpg` when WebGL2 is unavailable or the context fails. It also respects
 `prefers-reduced-motion`.
 
+Each frame runs a small forward pipeline: a 2048² shadow-map pass from the key softbox (PCSS, so
+contact shadows stay crisp and distant ones go soft), a view-space normal/depth prepass feeding
+half-res SSAO, then an HDR MSAA scene pass (reflection → floor → shoe) with GGX / clear-coat /
+sheen materials, anisotropic highlights on the carbon weave, thin-shell translucency on the pods,
+and procedural bump maps (knit, twill, foam cells, outsole lugs). An MSAA resolve, two-level bloom,
+ACES tone map, chromatic aberration, film grain and vignette are composited onto the page. If the
+GPU cannot render to half-float targets it pre-exposes into sRGB 8-bit buffers and skips SSAO.
+
 `hero3d_preview/` at the repo root is a standalone HTML snapshot of that renderer, kept outside the
 Vite build for visual comparison against the reference image.
 

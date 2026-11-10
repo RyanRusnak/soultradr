@@ -18,7 +18,10 @@ export function ConduitHero3D({ fallbackSrc, alt }: { fallbackSrc: string; alt: 
     return mountConduitHero(canvas, {
       reducedMotion,
       onReady: () => setStatus('ready'),
-      onError: () => setStatus('failed'),
+      onError: (err) => {
+        console.warn('[hero3d] falling back to still image:', err)
+        setStatus('failed')
+      },
       onAzimuth: (deg) => {
         if (azRef.current) azRef.current.textContent = deg.toFixed(1).padStart(5, '0')
       },
